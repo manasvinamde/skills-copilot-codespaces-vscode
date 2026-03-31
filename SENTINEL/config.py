@@ -38,6 +38,18 @@ class SentinelConfig:
     capital: float = float(os.getenv('SENTINEL_CAPITAL', '500000.0'))
     risk_per_trade_pct: float = float(os.getenv('SENTINEL_RISK_PCT', '0.5'))
     max_trade_risk_inr: float = capital * risk_per_trade_pct / 100
+    # Additional risk controls
+    min_rr: float = float(os.getenv('SENTINEL_MIN_RR', '2.0'))
+    # Hard per-trade risk cap as percentage of capital (default 2%)
+    hard_risk_cap_pct: float = float(os.getenv('SENTINEL_HARD_RISK_CAP_PCT', '2.0'))
+    # Portfolio-level allowed total risk as percentage of capital (default 10%)
+    portfolio_risk_pct: float = float(os.getenv('SENTINEL_PORTFOLIO_RISK_PCT', '10.0'))
+    # Minimum capital reserve to keep aside (INR)
+    min_capital_reserve: float = float(os.getenv('SENTINEL_MIN_CAPITAL_RESERVE', '0.0'))
+    # Keep a readable alias for min capital reserve in INR
+    min_capital_reserve_inr: float = min_capital_reserve
+    # Maximum percentage of capital allowed to be exposed at any time
+    max_exposure_pct: float = float(os.getenv('SENTINEL_MAX_EXPOSURE_PCT', '50.0'))
 
     trading_windows = [
         TradingWindow("PRE_OPEN", "09:10", "09:15"),
@@ -81,7 +93,12 @@ class SentinelConfig:
 
 
 def get_risk_amount(capital: float = SentinelConfig.capital, risk_pct: float = SentinelConfig.risk_per_trade_pct) -> float:
-    return (capital * risk_pct) / 100
+    raw = (capital * risk_pct) / 100
+    # Cap to configured absolute max per-trade risk
+    try:
+        return min(raw, SentinelConfig.max_trade_risk_inr)
+    except Exception:
+        return raw
 
 
 # --- Live enablement safety helpers -------------------------------------

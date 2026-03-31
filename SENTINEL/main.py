@@ -46,6 +46,11 @@ class SentinelBot:
         mock_mode = (self.execution_mode == ExecutionMode.PAPER)
         self.execution_engine = get_execution_engine(mock_mode=mock_mode)
         self.trade_logger = get_trade_logger()  # Initialize trade logger
+        # Attach execution engine reference to risk manager for exposure checks
+        try:
+            self.risk_manager.execution = self.execution_engine
+        except Exception:
+            pass
         
         # Initialize dashboard integration (check env variable or default to True)
         dashboard_enabled = os.getenv('DASHBOARD_ENABLED', 'true').lower() == 'true'
@@ -231,6 +236,28 @@ class SentinelBot:
                 }
                 candles.append(candle)
             
+            # SNIPER mode uses sniper module (higher conviction confluence)
+            if self.mode == Mode.SNIPER:
+                try:
+                    from sniper import score_sniper
+                    bars_dict = {
+                        'close': [c['close'] for c in candles],
+                        'high': [c['high'] for c in candles],
+                        'low': [c['low'] for c in candles],
+                        'volume': [c['volume'] for c in candles]
+                    }
+                    s = score_sniper(bars_dict)
+                    signal_str = s.get('signal', 'WAIT')
+                    reason = f"SNIPER score {s.get('score',0)} | {';'.join(s.get('reasons',[]))}"
+                    if signal_str == 'BUY':
+                        return Signal.BUY, reason
+                    elif signal_str == 'SELL':
+                        return Signal.SELL, reason
+                    else:
+                        return Signal.WAIT, reason
+                except Exception as e:
+                    logger.warning(f"Sniper module error: {e}")
+
             # Get signal from Scalper v2
             signal, reason = self.scalper_v2.get_signal_for_main(candles)
             logger.info(f"Strategy signal: {signal.value} - Reason: {reason}")
@@ -246,11 +273,69 @@ class SentinelBot:
             if not can_open:
                 logger.warning(f"Risk check failed for {symbol}: {reason}")
                 return False, reason
-            
             # Calculate position size
             stop_loss = entry_price * (1 - self.risk_manager.mode_config['stop_loss_pct'] / 100)
             quantity = self.risk_manager.calculate_position_size(entry_price, stop_loss)
-            
+
+            # Central RR gate: compute expected target from mode settings and enforce min_rr
+            try:
+                target_pct = self.risk_manager.mode_config.get('target_pct', 0.0)
+                if side.upper() == 'BUY':
+                    target = entry_price * (1 + target_pct / 100)
+                else:
+                    target = entry_price * (1 - target_pct / 100)
+
+                # Compute risk distance and reward distance
+                risk_dist = abs(entry_price - stop_loss)
+                reward_dist = abs(target - entry_price)
+                rr = (reward_dist / risk_dist) if risk_dist > 0 else 0.0
+
+                if rr < SentinelConfig.min_rr:
+                    logger.warning(f"RR check failed for {symbol}: RR={rr:.2f} < min_rr={SentinelConfig.min_rr}")
+                    return False, f"RR too low: {rr:.2f} < {SentinelConfig.min_rr}"
+            except Exception as e:
+                logger.warning(f"Error computing RR gate: {e}")
+                # Fail-safe: allow trade if RR computation fails (but log)
+            # --- Hard per-trade risk cap enforcement ---------------------------------
+            try:
+                # Risk per contract (INR) = stop distance
+                per_contract_risk = abs(entry_price - stop_loss)
+                computed_risk_inr = per_contract_risk * max(1, int(quantity))
+
+                per_trade_max_inr = SentinelConfig.capital * (SentinelConfig.hard_risk_cap_pct / 100.0)
+                if computed_risk_inr > per_trade_max_inr:
+                    # Reduce quantity to meet hard risk cap
+                    allowed_qty = int(per_trade_max_inr // per_contract_risk) if per_contract_risk > 0 else 0
+                    logger.warning(
+                        f"Per-trade hard risk cap triggered: computed_risk=₹{computed_risk_inr:.2f} > cap=₹{per_trade_max_inr:.2f}."
+                        f" Adjusting qty {quantity} → {allowed_qty}"
+                    )
+                    quantity = allowed_qty
+
+                if quantity == 0:
+                    return False, f"Per-trade hard risk cap prevents any position (max {SentinelConfig.hard_risk_cap_pct}%)"
+            except Exception as e:
+                logger.warning(f"Error applying hard per-trade cap: {e}")
+
+            # --- Portfolio-level total risk cap ------------------------------------
+            try:
+                # Sum current open risk across positions (stop_distance * qty)
+                existing_risk = 0.0
+                for pos in self.risk_manager.positions.values():
+                    if pos.stop_loss is not None:
+                        existing_risk += abs(pos.entry_price - pos.stop_loss) * pos.quantity
+
+                new_trade_risk = abs(entry_price - stop_loss) * max(1, int(quantity))
+                total_projected_risk = existing_risk + new_trade_risk
+                portfolio_risk_limit = SentinelConfig.capital * (SentinelConfig.portfolio_risk_pct / 100.0)
+
+                if total_projected_risk > portfolio_risk_limit:
+                    logger.warning(
+                        f"Portfolio risk cap exceeded: projected_risk=₹{total_projected_risk:.2f} > limit=₹{portfolio_risk_limit:.2f}"
+                    )
+                    return False, f"Portfolio risk cap exceeded ({SentinelConfig.portfolio_risk_pct}% of capital)"
+            except Exception as e:
+                logger.warning(f"Error computing portfolio risk cap: {e}")
             if quantity == 0:
                 logger.warning(f"Position size is zero for {symbol}")
                 return False, "Invalid position size"
@@ -304,7 +389,17 @@ class SentinelBot:
 
             # Step 2: Place order through execution engine with position sizing
             logger.info(f"Placing {side} order: {quantity} {symbol} @ ₹{entry_price:.2f}")
-            
+            # Reserve exposure before placing order to ensure total exposure caps
+            reserved = False
+            try:
+                reserved = self.execution_engine.reserve_exposure(entry_price * quantity)
+            except Exception:
+                reserved = False
+
+            if not reserved:
+                logger.warning("Unable to reserve exposure for order - skipping execution")
+                return False
+
             result = self.execution_engine.place_order(
                 symbol=symbol,
                 side=side,
@@ -312,6 +407,13 @@ class SentinelBot:
                 price=entry_price,
                 order_type="MARKET"
             )
+
+            # If placement failed, release the reserved exposure
+            if not result.success:
+                try:
+                    self.execution_engine.release_exposure(entry_price * quantity)
+                except Exception:
+                    pass
 
             if result.success:
                 # Step 3: Print execution confirmation
@@ -819,12 +921,23 @@ def main():
     else:
         execution_mode = ExecutionMode.LIVE if args.execution == 'LIVE' else ExecutionMode.PAPER
 
-    # Safety gate: require explicit opt-in for LIVE execution via environment
-    if execution_mode == ExecutionMode.LIVE and not is_live_allowed():
-        logger.error("LIVE execution requested but ENABLE_LIVE environment flag or approval phrase not present.")
-        logger.error("To enable LIVE trading set ENABLE_LIVE=1 and optionally set LIVE_APPROVAL_PHRASE to require a phrase.")
-        logger.error("Falling back to PAPER mode to avoid accidental live trading.")
-        execution_mode = ExecutionMode.PAPER
+    # Safety gate: require explicit opt-in for LIVE execution via environment or persistent approval
+    if execution_mode == ExecutionMode.LIVE:
+        # If environment/phrase guard fails and persistent approval not present, fallback to PAPER
+        try:
+            from live_control import is_approved as live_control_approved, is_kill_active
+            if (not is_live_allowed()) and (not live_control_approved()):
+                logger.error("LIVE execution requested but ENABLE_LIVE environment flag and persistent approval are missing.")
+                logger.error("To enable LIVE trading set ENABLE_LIVE=1 and/or persist approval via API (/enable_live). Falling back to PAPER.")
+                execution_mode = ExecutionMode.PAPER
+
+            # If kill switch is active, refuse to run live
+            if 'is_kill_active' in globals() and is_kill_active():
+                logger.error("Kill-switch is active. Disabling LIVE execution (falling back to PAPER).")
+                execution_mode = ExecutionMode.PAPER
+        except Exception:
+            logger.exception("Error checking persistent live approval; falling back to PAPER for safety.")
+            execution_mode = ExecutionMode.PAPER
     
     # Create bot
     bot = SentinelBot(
