@@ -7,7 +7,7 @@ def test_reserve_and_release_basic():
     eng = DhanExecutionEngine(mock_mode=True)
     initial = eng.used_exposure_inr
 
-    # Determine available exposure and reserve a safe fraction for the test
+    # Determine available exposure and reserve a safe fraction for the tes
     max_exposure = eng.max_exposure_inr
     min_reserve = eng.min_capital_reserve
     available = max_exposure - min_reserve - eng.used_exposure_inr

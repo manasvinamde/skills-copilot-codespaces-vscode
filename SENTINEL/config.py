@@ -44,6 +44,14 @@ class SentinelConfig:
     hard_risk_cap_pct: float = float(os.getenv('SENTINEL_HARD_RISK_CAP_PCT', '2.0'))
     # Portfolio-level allowed total risk as percentage of capital (default 10%)
     portfolio_risk_pct: float = float(os.getenv('SENTINEL_PORTFOLIO_RISK_PCT', '10.0'))
+    # Daily loss limit as percent of capital (stop trading when loss >= this percent)
+    daily_loss_limit_pct: float = float(os.getenv('SENTINEL_DAILY_LOSS_PCT', '3.0'))
+    # Execution circuit breaker: number of failures within window to trip
+    exec_failure_threshold: int = int(os.getenv('SENTINEL_EXEC_FAILURE_THRESHOLD', '5'))
+    # Time window in seconds over which execution failures are counted
+    exec_failure_window_seconds: int = int(os.getenv('SENTINEL_EXEC_FAILURE_WINDOW', '300'))
+    # Circuit breaker cooldown in seconds after tripping
+    exec_failure_cooldown_seconds: int = int(os.getenv('SENTINEL_EXEC_FAILURE_COOLDOWN', '600'))
     # Minimum capital reserve to keep aside (INR)
     min_capital_reserve: float = float(os.getenv('SENTINEL_MIN_CAPITAL_RESERVE', '0.0'))
     # Keep a readable alias for min capital reserve in INR
@@ -79,11 +87,11 @@ class SentinelConfig:
     underlying_symbol: str = "NIFTY"           # Base symbol (NIFTY, BANKNIFTY, etc.)
     instrument_type: str = "OPTION"            # OPTION, FUTURE, etc.
     symbol: str = "NIFTY_OPTION"               # Trading symbol (combined: underlying + instrument)
-    
+
     # Alternative supported symbols (uncomment to change)
     # symbol: str = "BANKNIFTY_OPTION"
     # symbol: str = "FINNIFTY_OPTION"
-    
+
     expiry_weekday: str = "THURSDAY"           # Options expiry day
 
     log_level: str = "INFO"
