@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# Logs and runtime
+*.log
+sentinel.log
+trades/
+
+# Token/credential files
+.dashboard_token.json
+.dhan_token.json
+.env
+
+# Editor/temp
+.DS_Store
+*.swp
+*.swo
+/.vscode/
